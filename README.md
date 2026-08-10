@@ -31,8 +31,8 @@ cp .env.example .env
 PROTON_BRIDGE_HOST=127.0.0.1
 PROTON_BRIDGE_IMAP_PORT=1143
 PROTON_BRIDGE_SMTP_PORT=1025
-PROTON_BRIDGE_USER=your@proton.me
-PROTON_BRIDGE_PASS=your-bridge-password
+PROTON_BRIDGE_USERNAME=your@proton.me
+PROTON_BRIDGE_PASSWORD=your-bridge-password
 PROTON_BRIDGE_FROM=your@proton.me
 ```
 
@@ -54,8 +54,8 @@ Add to your Claude Desktop config (`~/.config/claude/claude_desktop_config.json`
         "PROTON_BRIDGE_HOST": "127.0.0.1",
         "PROTON_BRIDGE_IMAP_PORT": "1143",
         "PROTON_BRIDGE_SMTP_PORT": "1025",
-        "PROTON_BRIDGE_USER": "your@proton.me",
-        "PROTON_BRIDGE_PASS": "your-bridge-password",
+        "PROTON_BRIDGE_USERNAME": "your@proton.me",
+        "PROTON_BRIDGE_PASSWORD": "your-bridge-password",
         "PROTON_BRIDGE_FROM": "your@proton.me"
       }
     }
