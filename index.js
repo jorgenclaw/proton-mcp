@@ -115,13 +115,14 @@ server.tool(
 // --- Tool: get_message ---
 server.tool(
   'mail__get_message',
-  'Get a single email by message ID (sequence number). Includes threading headers.',
+  'Get a single email by message ID (IMAP UID). Includes threading headers.',
   {
-    message_id: z.number().describe('Message sequence number from list_messages'),
+    message_id: z.number().describe('Message ID from list_messages / search_messages'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
   },
   async (args) => {
     try {
-      const result = await getMessage(getConfig(), args.message_id);
+      const result = await getMessage(getConfig(), args.message_id, args.folder);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     } catch (err) {
       return errorResult(err.message);
@@ -179,7 +180,8 @@ server.tool(
   'mail__reply_message',
   'Reply to an email, preserving the thread. Set reply_all=true to include all original recipients.',
   {
-    message_id: z.number().describe('Sequence number of the message to reply to'),
+    message_id: z.number().describe('ID of the message to reply to'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
     body: z.string().describe('Reply body (plain text)'),
     reply_all: z.boolean().optional().describe('Reply to all recipients (default: false, reply to sender only)'),
     cc: z.string().optional().describe('Additional CC recipient(s), comma-separated'),
@@ -195,6 +197,7 @@ server.tool(
     try {
       const result = await replyMessage(getConfig(), {
         originalMessageId: args.message_id,
+        folder: args.folder,
         body: args.body,
         replyAll: args.reply_all,
         cc: args.cc,
@@ -213,11 +216,12 @@ server.tool(
   'mail__get_thread',
   'Fetch the full email chain (thread) for a message',
   {
-    message_id: z.number().describe('Sequence number of any message in the thread'),
+    message_id: z.number().describe('ID of any message in the thread'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
   },
   async (args) => {
     try {
-      const result = await getThread(getConfig(), args.message_id);
+      const result = await getThread(getConfig(), args.message_id, args.folder);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     } catch (err) {
       return errorResult(err.message);
@@ -230,12 +234,13 @@ server.tool(
   'mail__mark_message',
   'Mark an email as read or unread',
   {
-    message_id: z.number().describe('Message sequence number'),
+    message_id: z.number().describe('Message ID'),
     read: z.boolean().describe('true = mark as read, false = mark as unread'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
   },
   async (args) => {
     try {
-      const result = await markMessage(getConfig(), args.message_id, args.read);
+      const result = await markMessage(getConfig(), args.message_id, args.read, args.folder);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     } catch (err) {
       return errorResult(err.message);
@@ -248,7 +253,8 @@ server.tool(
   'mail__forward_message',
   'Forward an email to another recipient',
   {
-    message_id: z.number().describe('Sequence number of the message to forward'),
+    message_id: z.number().describe('ID of the message to forward'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
     to: z.string().describe('Recipient email address'),
     body: z.string().optional().describe('Optional message to prepend'),
     cc: z.string().optional().describe('CC recipient(s), comma-separated'),
@@ -256,7 +262,7 @@ server.tool(
   },
   async (args) => {
     try {
-      const result = await forwardMessage(getConfig(), args);
+      const result = await forwardMessage(getConfig(), { ...args, originalMessageId: args.message_id });
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     } catch (err) {
       return errorResult(err.message);
@@ -269,12 +275,13 @@ server.tool(
   'mail__star_message',
   'Star or unstar an email',
   {
-    message_id: z.number().describe('Message sequence number'),
+    message_id: z.number().describe('Message ID'),
     star: z.boolean().describe('true = star, false = unstar'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
   },
   async (args) => {
     try {
-      return { content: [{ type: 'text', text: JSON.stringify(await starMessage(getConfig(), args.message_id, args.star)) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(await starMessage(getConfig(), args.message_id, args.star, args.folder)) }] };
     } catch (err) { return errorResult(err.message); }
   },
 );
@@ -282,13 +289,14 @@ server.tool(
 // --- Tool: delete_message ---
 server.tool(
   'mail__delete_message',
-  'Permanently delete an email from inbox',
+  'Permanently delete an email',
   {
-    message_id: z.number().describe('Message sequence number'),
+    message_id: z.number().describe('Message ID'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
   },
   async (args) => {
     try {
-      return { content: [{ type: 'text', text: JSON.stringify(await deleteMessage(getConfig(), args.message_id)) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(await deleteMessage(getConfig(), args.message_id, args.folder)) }] };
     } catch (err) { return errorResult(err.message); }
   },
 );
@@ -298,12 +306,13 @@ server.tool(
   'mail__move_message',
   'Move an email to a different folder (e.g. Trash, Archive, a label)',
   {
-    message_id: z.number().describe('Message sequence number'),
+    message_id: z.number().describe('Message ID'),
     folder: z.string().describe('Destination folder name (use mail__list_folders to see available folders)'),
+    source_folder: z.string().optional().describe('Folder the message is in now (default INBOX)'),
   },
   async (args) => {
     try {
-      return { content: [{ type: 'text', text: JSON.stringify(await moveMessage(getConfig(), args.message_id, args.folder)) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(await moveMessage(getConfig(), args.message_id, args.folder, args.source_folder)) }] };
     } catch (err) { return errorResult(err.message); }
   },
 );
@@ -340,11 +349,12 @@ server.tool(
   'mail__get_attachments',
   'Download attachments from an email. Returns base64-encoded content.',
   {
-    message_id: z.number().describe('Message sequence number'),
+    message_id: z.number().describe('Message ID'),
+    folder: z.string().optional().describe('Folder the message is in (default INBOX); use the folder from search results'),
   },
   async (args) => {
     try {
-      return { content: [{ type: 'text', text: JSON.stringify(await getAttachments(getConfig(), args.message_id)) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(await getAttachments(getConfig(), args.message_id, args.folder)) }] };
     } catch (err) { return errorResult(err.message); }
   },
 );

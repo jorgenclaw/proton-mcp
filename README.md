@@ -28,13 +28,15 @@ cp .env.example .env
 ## Configuration
 
 ```env
-PROTON_BRIDGE_HOST=127.0.0.1
+PROTON_BRIDGE_IMAP_HOST=127.0.0.1
+PROTON_BRIDGE_SMTP_HOST=127.0.0.1
 PROTON_BRIDGE_IMAP_PORT=1143
 PROTON_BRIDGE_SMTP_PORT=1025
-PROTON_BRIDGE_USER=your@proton.me
-PROTON_BRIDGE_PASS=your-bridge-password
-PROTON_BRIDGE_FROM=your@proton.me
+PROTON_BRIDGE_USERNAME=your@proton.me
+PROTON_BRIDGE_PASSWORD=your-bridge-password
 ```
+
+Alternatively, put the same settings in `~/.proton-mcp/bridge.json` (keys `imap_host`, `imap_port`, `smtp_host`, `smtp_port`, `username`, `password`); it takes precedence over the env vars.
 
 The Bridge password is found in Proton Bridge → Settings → your account → IMAP/SMTP password (this is NOT your Proton account password).
 
@@ -51,12 +53,12 @@ Add to your Claude Desktop config (`~/.config/claude/claude_desktop_config.json`
       "command": "node",
       "args": ["/path/to/proton-mcp/index.js"],
       "env": {
-        "PROTON_BRIDGE_HOST": "127.0.0.1",
+        "PROTON_BRIDGE_IMAP_HOST": "127.0.0.1",
+        "PROTON_BRIDGE_SMTP_HOST": "127.0.0.1",
         "PROTON_BRIDGE_IMAP_PORT": "1143",
         "PROTON_BRIDGE_SMTP_PORT": "1025",
-        "PROTON_BRIDGE_USER": "your@proton.me",
-        "PROTON_BRIDGE_PASS": "your-bridge-password",
-        "PROTON_BRIDGE_FROM": "your@proton.me"
+        "PROTON_BRIDGE_USERNAME": "your@proton.me",
+        "PROTON_BRIDGE_PASSWORD": "your-bridge-password"
       }
     }
   }
@@ -77,7 +79,9 @@ The server communicates via MCP stdio protocol.
 
 ## Tools (36)
 
-### Mail (16 tools)
+`message_id` is the message's IMAP UID, which stays stable within a folder. Tools that act on a message take an optional `folder` (default `INBOX`); pass the `folder` that `mail__search_messages` returns for results outside the inbox. `mail__move_message` takes `source_folder` for this, since `folder` is its destination.
+
+### Mail (15 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -96,7 +100,6 @@ The server communicates via MCP stdio protocol.
 | `mail__list_folders` | List all mail folders |
 | `mail__list_folder_messages` | List messages in a specific folder |
 | `mail__get_attachments` | Download message attachments |
-| `mail__get_thread` | Reconstruct full conversation thread |
 
 ### Pass (9 tools)
 

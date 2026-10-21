@@ -3,6 +3,7 @@
  * Handles send and reply operations via nodemailer
  */
 
+import path from 'path';
 import nodemailer from 'nodemailer';
 import { getMessageHeaders, getMessage as getFullMessage } from './imap-client.js';
 
@@ -19,6 +20,18 @@ function createTransporter(config) {
   });
 }
 
+// Tool input -> nodemailer attachments. `content` is base64; `path` must be a
+// local absolute path (nodemailer would otherwise fetch http(s) URLs).
+function toAttachments(list) {
+  return list?.map(({ filename, path: p, content, contentType }) => {
+    if (p !== undefined) {
+      if (!path.isAbsolute(p)) throw new Error(`Attachment path must be an absolute local path: ${p}`);
+      return { filename, contentType, path: p };
+    }
+    return { filename, contentType, content, encoding: 'base64' };
+  });
+}
+
 export async function sendMessage(config, { to, subject, body, html, cc, bcc, attachments }) {
   const transporter = createTransporter(config);
 
@@ -28,7 +41,7 @@ export async function sendMessage(config, { to, subject, body, html, cc, bcc, at
     cc,
     bcc,
     subject,
-    attachments,
+    attachments: toAttachments(attachments),
   };
   if (html) {
     mailOpts.html = html;
@@ -41,8 +54,8 @@ export async function sendMessage(config, { to, subject, body, html, cc, bcc, at
   return { success: true, message_id: info.messageId };
 }
 
-export async function forwardMessage(config, { originalMessageId, to, body, cc, bcc }) {
-  const original = await getFullMessage(config, originalMessageId);
+export async function forwardMessage(config, { originalMessageId, folder, to, body, cc, bcc }) {
+  const original = await getFullMessage(config, originalMessageId, folder);
 
   const fwdSubject = original.subject.startsWith('Fwd:')
     ? original.subject
@@ -64,8 +77,8 @@ export async function forwardMessage(config, { originalMessageId, to, body, cc, 
   return { success: true, message_id: info.messageId };
 }
 
-export async function replyMessage(config, { originalMessageId, body, cc, bcc, replyAll, attachments }) {
-  const headers = await getMessageHeaders(config, originalMessageId);
+export async function replyMessage(config, { originalMessageId, folder, body, cc, bcc, replyAll, attachments }) {
+  const headers = await getMessageHeaders(config, originalMessageId, folder);
 
   const replySubject = headers.subject.startsWith('Re:')
     ? headers.subject
@@ -98,7 +111,7 @@ export async function replyMessage(config, { originalMessageId, body, cc, bcc, r
     text: body,
     inReplyTo: headers.messageId,
     references: referencesStr,
-    attachments,
+    attachments: toAttachments(attachments),
   });
 
   return { success: true, message_id: info.messageId };

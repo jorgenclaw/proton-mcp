@@ -1,133 +1,106 @@
 /**
  * IMAP client for Proton Bridge
  * Handles read operations: list, get, search, unread, thread, mark
+ *
+ * Message IDs are IMAP UIDs, which are stable within a folder. (Sequence
+ * numbers shift whenever mail arrives or is removed, so acting on one later
+ * can hit the wrong message.)
  */
 
-import Imap from 'imap';
+import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 
 /**
  * Create a short-lived IMAP connection, run `fn`, then close.
  */
-function withImap(config, fn) {
-  return new Promise((resolve, reject) => {
-    const imap = new Imap({
-      user: config.username,
-      password: config.password,
-      host: config.imap_host || '127.0.0.1',
-      port: config.imap_port || 1143,
-      tls: false,
-      authTimeout: 10000,
-    });
-
-    imap.once('ready', () => {
-      fn(imap)
-        .then((result) => {
-          imap.end();
-          resolve(result);
-        })
-        .catch((err) => {
-          imap.end();
-          reject(err);
-        });
-    });
-
-    imap.once('error', (err) => reject(new Error(`IMAP connection failed: ${err.message}. Is Proton Bridge running?`)));
-    imap.connect();
+async function withImap(config, fn) {
+  const client = new ImapFlow({
+    host: config.imap_host || '127.0.0.1',
+    port: config.imap_port || 1143,
+    secure: false,
+    doSTARTTLS: false, // Bridge listens on loopback only
+    auth: { user: config.username, pass: config.password },
+    logger: false,
   });
+  // Without a listener, a socket error would crash the whole MCP server
+  client.on('error', () => {});
+
+  try {
+    await client.connect();
+  } catch (err) {
+    throw new Error(`IMAP connection failed: ${err.responseText || err.message}. Is Proton Bridge running?`);
+  }
+  try {
+    return await fn(client);
+  } finally {
+    await client.logout().catch(() => client.close());
+  }
 }
 
 /**
- * Fetch messages by sequence numbers. Returns parsed message objects.
+ * Fetch raw messages by UID (or by sequence range when bySeq is set).
+ * Returns [{ uid, flags, raw: Buffer }].
  */
-function fetchMessages(imap, seqnos, bodiesOpt = '') {
-  return new Promise((resolve, reject) => {
-    if (seqnos.length === 0) { resolve([]); return; }
+async function fetchRaw(client, source, bodiesOpt = '', { bySeq = false } = {}) {
+  if (source.length === 0) return [];
+  const query = { uid: true, flags: true, ...(bodiesOpt === 'HEADER' ? { headers: true } : { source: true }) };
+  const messages = [];
+  for await (const msg of client.fetch(source, query, { uid: !bySeq })) {
+    messages.push({ uid: msg.uid, flags: [...(msg.flags || [])], raw: msg.headers || msg.source || Buffer.alloc(0) });
+  }
+  return messages;
+}
 
-    const messages = [];
-    const f = imap.fetch(seqnos, { bodies: bodiesOpt, struct: true });
-
-    f.on('message', (msg, seqno) => {
-      let raw = '';
-      msg.on('body', (stream) => {
-        stream.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+/**
+ * Fetch messages and parse them. Returns parsed message objects.
+ */
+async function fetchMessages(client, source, bodiesOpt = '', opts) {
+  const parsed = [];
+  for (const m of await fetchRaw(client, source, bodiesOpt, opts)) {
+    const seen = m.flags.includes('\\Seen');
+    try {
+      const mail = await simpleParser(m.raw);
+      parsed.push({
+        id: m.uid,
+        subject: mail.subject || '(no subject)',
+        from: mail.from?.text || 'unknown',
+        to: mail.to?.text || '',
+        cc: mail.cc?.text || '',
+        date: mail.date?.toISOString() || '',
+        body: mail.text || mail.html || '',
+        message_id_header: mail.messageId || null,
+        in_reply_to: mail.inReplyTo || null,
+        references: [].concat(mail.references || []),
+        seen,
       });
-      msg.once('end', () => {
-        messages.push({ seqno, raw });
-      });
-    });
+    } catch {
+      parsed.push({ id: m.uid, subject: '(parse error)', from: '', to: '', date: '', body: '', message_id_header: null, in_reply_to: null, references: [], seen });
+    }
+  }
+  return parsed;
+}
 
-    f.once('error', reject);
-    f.once('end', async () => {
-      const parsed = [];
-      for (const m of messages) {
-        try {
-          const mail = await simpleParser(m.raw);
-          parsed.push({
-            id: m.seqno,
-            subject: mail.subject || '(no subject)',
-            from: mail.from?.text || 'unknown',
-            to: mail.to?.text || '',
-            cc: mail.cc?.text || '',
-            date: mail.date?.toISOString() || '',
-            body: mail.text || mail.html || '',
-            message_id_header: mail.messageId || null,
-            in_reply_to: mail.inReplyTo || null,
-            references: mail.references || [],
-            seen: true, // will be overridden by caller if needed
-          });
-        } catch {
-          parsed.push({ id: m.seqno, subject: '(parse error)', from: '', to: '', date: '', body: '', message_id_header: null, in_reply_to: null, references: [], seen: true });
-        }
-      }
-      resolve(parsed);
-    });
-  });
+function openFolder(client, folder, readOnly = true) {
+  return client.mailboxOpen(folder, { readOnly });
 }
 
 /**
- * Open INBOX and return box info.
+ * IMAP SEARCH wrapper. Returns UIDs.
  */
-function openInbox(imap, readOnly = true) {
-  return new Promise((resolve, reject) => {
-    imap.openBox('INBOX', readOnly, (err, box) => {
-      if (err) reject(err);
-      else resolve(box);
-    });
-  });
-}
-
-function openFolder(imap, folder, readOnly = true) {
-  return new Promise((resolve, reject) => {
-    imap.openBox(folder, readOnly, (err, box) => {
-      if (err) reject(err);
-      else resolve(box);
-    });
-  });
-}
-
-/**
- * IMAP SEARCH wrapper.
- */
-function imapSearch(imap, criteria) {
-  return new Promise((resolve, reject) => {
-    imap.search(criteria, (err, results) => {
-      if (err) reject(err);
-      else resolve(results || []);
-    });
-  });
+async function imapSearch(client, query) {
+  return (await client.search(query, { uid: true })) || [];
 }
 
 // --- Exported operations ---
 
 export async function getUnread(config) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, true);
-    const uids = await imapSearch(imap, ['UNSEEN']);
+  return withImap(config, async (client) => {
+    await openFolder(client, 'INBOX', true);
+    const uids = await imapSearch(client, { seen: false });
     if (uids.length === 0) return { count: 0, messages: [] };
 
     const recent = uids.slice(-20);
-    const messages = await fetchMessages(imap, recent, 'HEADER');
+    const messages = await fetchMessages(client, recent, 'HEADER');
     return {
       count: uids.length,
       messages: messages.map((m) => ({
@@ -141,45 +114,30 @@ export async function getUnread(config) {
 }
 
 export async function listMessages(config, limit = 10) {
-  return withImap(config, async (imap) => {
-    const box = await openInbox(imap, true);
-    const total = box.messages.total;
-    if (total === 0) return [];
-
-    const start = Math.max(1, total - limit + 1);
-    const range = `${start}:${total}`;
-
-    const messages = await fetchMessages(imap, range, 'HEADER');
-
-    // Check which are unseen
-    const unseenIds = new Set(await imapSearch(imap, ['UNSEEN']));
-    return messages
-      .map((m) => ({ ...m, seen: !unseenIds.has(m.id), body: undefined }))
-      .reverse();
-  });
+  return listMessagesInFolder(config, 'INBOX', limit);
 }
 
-export async function getMessage(config, messageId) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, true);
-    const messages = await fetchMessages(imap, [messageId], '');
-    if (messages.length === 0) throw new Error(`Message ${messageId} not found`);
+export async function getMessage(config, messageId, folder = 'INBOX') {
+  return withImap(config, async (client) => {
+    await openFolder(client, folder, true);
+    const messages = await fetchMessages(client, [messageId], '');
+    if (messages.length === 0) throw new Error(`Message ${messageId} not found in ${folder}`);
     return messages[0];
   });
 }
 
 export async function searchMessages(config, query) {
-  return withImap(config, async (imap) => {
+  return withImap(config, async (client) => {
     const allMessages = [];
     const folders = ['INBOX', 'Sent', 'Drafts', 'Archive'];
 
     for (const folder of folders) {
       try {
-        await openFolder(imap, folder, true);
-        const uids = await imapSearch(imap, [['TEXT', query]]);
+        await openFolder(client, folder, true);
+        const uids = await imapSearch(client, { text: query });
         if (uids.length > 0) {
           const recent = uids.slice(-10);
-          const messages = await fetchMessages(imap, recent, 'HEADER');
+          const messages = await fetchMessages(client, recent, 'HEADER');
           allMessages.push(...messages.map((m) => ({ ...m, body: undefined, folder })));
         }
       } catch {
@@ -193,11 +151,11 @@ export async function searchMessages(config, query) {
   });
 }
 
-export async function getMessageHeaders(config, messageId) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, true);
-    const messages = await fetchMessages(imap, [messageId], 'HEADER');
-    if (messages.length === 0) throw new Error(`Message ${messageId} not found`);
+export async function getMessageHeaders(config, messageId, folder = 'INBOX') {
+  return withImap(config, async (client) => {
+    await openFolder(client, folder, true);
+    const messages = await fetchMessages(client, [messageId], 'HEADER');
+    if (messages.length === 0) throw new Error(`Message ${messageId} not found in ${folder}`);
     return {
       messageId: messages[0].message_id_header,
       subject: messages[0].subject,
@@ -210,13 +168,13 @@ export async function getMessageHeaders(config, messageId) {
   });
 }
 
-export async function getThread(config, messageId) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, true);
+export async function getThread(config, messageId, folder = 'INBOX') {
+  return withImap(config, async (client) => {
+    await openFolder(client, folder, true);
 
     // 1. Fetch the starting message to get its threading headers
-    const startMsgs = await fetchMessages(imap, [messageId], '');
-    if (startMsgs.length === 0) throw new Error(`Message ${messageId} not found`);
+    const startMsgs = await fetchMessages(client, [messageId], '');
+    if (startMsgs.length === 0) throw new Error(`Message ${messageId} not found in ${folder}`);
 
     // 2. Collect all Message-IDs in the thread
     const refIds = [
@@ -225,153 +183,97 @@ export async function getThread(config, messageId) {
       startMsgs[0].in_reply_to,
     ].filter(Boolean);
 
-    // 3. Search INBOX for each referenced Message-ID
-    const allSeqnos = new Set([messageId]);
+    // 3. Search the folder for each referenced Message-ID
+    const allUids = new Set([messageId]);
     for (const id of refIds) {
-      const results = await imapSearch(imap, [['HEADER', 'Message-ID', id]]);
-      results.forEach(n => allSeqnos.add(n));
+      const results = await imapSearch(client, { header: { 'message-id': id } });
+      results.forEach(n => allUids.add(n));
     }
 
     // 4. Fetch all matching messages
-    const seqnoArray = [...allSeqnos];
-    const threadMsgs = await fetchMessages(imap, seqnoArray, '');
+    const threadMsgs = await fetchMessages(client, [...allUids], '');
 
     // 5. Sort chronologically
     return threadMsgs.sort((a, b) => new Date(a.date) - new Date(b.date));
   });
 }
 
-export async function markMessage(config, messageId, read) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, false);
-    await new Promise((resolve, reject) => {
-      const fn = read ? imap.addFlags.bind(imap) : imap.delFlags.bind(imap);
-      fn(messageId, ['\\Seen'], (err) => {
-        if (err) reject(err); else resolve();
-      });
-    });
-    return { success: true, message_id: messageId, read };
+async function setFlag(config, messageId, flag, on, folder) {
+  return withImap(config, async (client) => {
+    await openFolder(client, folder, false);
+    const fn = on ? client.messageFlagsAdd : client.messageFlagsRemove;
+    if (!(await fn.call(client, [messageId], [flag], { uid: true }))) {
+      throw new Error(`Could not update message ${messageId} in ${folder}`);
+    }
   });
 }
 
-export async function starMessage(config, messageId, star) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, false);
-    await new Promise((resolve, reject) => {
-      const fn = star ? imap.addFlags.bind(imap) : imap.delFlags.bind(imap);
-      fn(messageId, ['\\Flagged'], (err) => {
-        if (err) reject(err); else resolve();
-      });
-    });
-    return { success: true, message_id: messageId, starred: star };
-  });
+export async function markMessage(config, messageId, read, folder = 'INBOX') {
+  await setFlag(config, messageId, '\\Seen', read, folder);
+  return { success: true, message_id: messageId, read };
 }
 
-export async function deleteMessage(config, messageId) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, false);
-    await new Promise((resolve, reject) => {
-      imap.store(messageId, '+FLAGS', ['\\Deleted'], (err) => {
-        if (err) reject(err); else resolve();
-      });
-    });
-    await new Promise((resolve, reject) => {
-      imap.expunge((err) => {
-        if (err) reject(err); else resolve();
-      });
-    });
+export async function starMessage(config, messageId, star, folder = 'INBOX') {
+  await setFlag(config, messageId, '\\Flagged', star, folder);
+  return { success: true, message_id: messageId, starred: star };
+}
+
+// UID EXPUNGE (UIDPLUS) removes only this message, not every message in the
+// folder that happens to carry \Deleted.
+export async function deleteMessage(config, messageId, folder = 'INBOX') {
+  return withImap(config, async (client) => {
+    await openFolder(client, folder, false);
+    if (!(await client.messageDelete([messageId], { uid: true }))) {
+      throw new Error(`Could not delete message ${messageId} in ${folder}`);
+    }
     return { success: true, message_id: messageId, deleted: true };
   });
 }
 
-export async function moveMessage(config, messageId, destFolder) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, false);
-    await new Promise((resolve, reject) => {
-      imap.move(messageId, destFolder, (err) => {
-        if (err) reject(err); else resolve();
-      });
-    });
-    return { success: true, message_id: messageId, moved_to: destFolder };
+export async function moveMessage(config, messageId, destFolder, folder = 'INBOX') {
+  return withImap(config, async (client) => {
+    await openFolder(client, folder, false);
+    const result = await client.messageMove([messageId], destFolder, { uid: true });
+    if (!result) throw new Error(`Could not move message ${messageId} from ${folder} to ${destFolder}`);
+    return { success: true, message_id: messageId, moved_to: destFolder, new_id: result.uidMap?.get(messageId) ?? null };
   });
 }
 
 export async function listFolders(config) {
-  return withImap(config, async (imap) => {
-    return new Promise((resolve, reject) => {
-      imap.getBoxes((err, boxes) => {
-        if (err) reject(err);
-        else {
-          const folders = [];
-          function walk(obj, prefix = '') {
-            for (const [name, box] of Object.entries(obj)) {
-              const fullName = prefix ? `${prefix}${box.delimiter}${name}` : name;
-              folders.push({ name: fullName, delimiter: box.delimiter });
-              if (box.children) walk(box.children, fullName);
-            }
-          }
-          walk(boxes);
-          resolve(folders);
-        }
-      });
-    });
-  });
-}
-
-function openBox(imap, folder, readOnly = true) {
-  return new Promise((resolve, reject) => {
-    imap.openBox(folder, readOnly, (err, box) => {
-      if (err) reject(err);
-      else resolve(box);
-    });
+  return withImap(config, async (client) => {
+    const boxes = await client.list();
+    return boxes.map((b) => ({ name: b.path, delimiter: b.delimiter }));
   });
 }
 
 export async function listMessagesInFolder(config, folder, limit = 10) {
-  return withImap(config, async (imap) => {
-    const box = await openBox(imap, folder, true);
-    const total = box.messages.total;
+  return withImap(config, async (client) => {
+    const box = await openFolder(client, folder, true);
+    const total = box.exists;
     if (total === 0) return [];
 
     const start = Math.max(1, total - limit + 1);
     const range = `${start}:${total}`;
 
-    const messages = await fetchMessages(imap, range, 'HEADER');
+    const messages = await fetchMessages(client, range, 'HEADER', { bySeq: true });
     return messages
       .map((m) => ({ ...m, body: undefined }))
-      .reverse();
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
   });
 }
 
-export async function getAttachments(config, messageId) {
-  return withImap(config, async (imap) => {
-    await openInbox(imap, true);
+export async function getAttachments(config, messageId, folder = 'INBOX') {
+  return withImap(config, async (client) => {
+    await openFolder(client, folder, true);
+    const [m] = await fetchRaw(client, [messageId], '');
+    if (!m) throw new Error(`Message ${messageId} not found in ${folder}`);
 
-    return new Promise((resolve, reject) => {
-      const f = imap.fetch([messageId], { bodies: '', struct: true });
-      let raw = '';
-
-      f.on('message', (msg) => {
-        msg.on('body', (stream) => {
-          stream.on('data', (chunk) => { raw += chunk.toString('utf8'); });
-        });
-      });
-
-      f.once('error', reject);
-      f.once('end', async () => {
-        try {
-          const mail = await simpleParser(raw);
-          const attachments = (mail.attachments || []).map((a) => ({
-            filename: a.filename,
-            contentType: a.contentType,
-            size: a.size,
-            content: a.content.toString('base64'),
-          }));
-          resolve(attachments);
-        } catch (err) {
-          reject(err);
-        }
-      });
-    });
+    const mail = await simpleParser(m.raw);
+    return (mail.attachments || []).map((a) => ({
+      filename: a.filename,
+      contentType: a.contentType,
+      size: a.size,
+      content: a.content.toString('base64'),
+    }));
   });
 }
